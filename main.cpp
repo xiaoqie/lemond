@@ -43,14 +43,20 @@ struct sys_info {
     float uptime;
     int clock_ticks;
     int page_size;
-    ulong MemTotal, MemFree, MemAvailable, Buffers, Cached, SwapCached, Active, Inactive, Active_anon, Inactive_anon, Active_file, Inactive_file, Unevictable, Mlocked, SwapTotal, SwapFree, Dirty, Writeback, AnonPages, Mapped, Shmem, Slab, SReclaimable, SUnreclaim, KernelStack, PageTables, NFS_Unstable, Bounce, WritebackTmp, CommitLimit, Committed_AS, VmallocTotal, VmallocUsed, VmallocChunk, HardwareCorrupted, AnonHugePages, ShmemHugePages, ShmemPmdMapped, CmaTotal, CmaFree, HugePages_Total, HugePages_Free, HugePages_Rsvd, HugePages_Surp, Hugepagesize, DirectMap4k, DirectMap2M, DirectMap1G;
+    ulong MemTotal, MemFree, MemAvailable, Buffers, Cached, SwapCached, Active, Inactive, Active_anon, Inactive_anon,
+            Active_file, Inactive_file, Unevictable, Mlocked, SwapTotal, SwapFree, Dirty, Writeback, AnonPages,
+            Mapped, Shmem, Slab, SReclaimable, SUnreclaim, KernelStack, PageTables, NFS_Unstable, Bounce, WritebackTmp,
+            CommitLimit, Committed_AS, VmallocTotal, VmallocUsed, VmallocChunk, HardwareCorrupted, AnonHugePages,
+            ShmemHugePages, ShmemPmdMapped, CmaTotal, CmaFree, HugePages_Total, HugePages_Free, HugePages_Rsvd,
+            HugePages_Surp, Hugepagesize, DirectMap4k, DirectMap2M, DirectMap1G;
+    // ----------------------------
     string gpu_name;
     float gpu_fan_speed;
     uint gpu_memory_total, gpu_memory_free, gpu_shared_memory_total, gpu_shared_memory_free;
     float nv_gpu_usage, nv_mem_usage, nv_enc_usage, nv_dec_usage;
     int gpu_temp;
     float gpu_power_draw, gpu_power_limit;
-    int gpu_graphics_clock, gpu_sm_clock, gpu_mem_clock, gpu_video_click;
+    int gpu_graphics_clock, gpu_sm_clock, gpu_mem_clock, gpu_video_clock;
 
     // ----------------------------
     map<string, cpu_info> cpus;
@@ -67,7 +73,8 @@ struct proc_info {
     ulonglong starttime;
     ulong vsize;
     long rss;
-    ulong rsslim, startcode, endcode, startstack, kstkesp, kstkeip, signal, blocked, sigignore, sigcatch, wchan, nswap, cnswap;
+    ulong rsslim, startcode, endcode, startstack, kstkesp, kstkeip, signal, blocked,
+            sigignore, sigcatch, wchan, nswap, cnswap;
     int exit_signal, processor;
     uint rt_priority, policy;
     ulonglong delayacct_blkio_ticks;
@@ -76,68 +83,35 @@ struct proc_info {
     ulong start_data, end_data, start_brk, arg_start, arg_end, env_start, env_end;
     int exit_code;
     // ----------- above from /proc/[pid]/stat ------------
-//    ulong rchar, wchar, syscr, syscw, read_bytes, write_bytes, cancelled_write_bytes;
-    // ----------- above from /proc/[pid]/io ------------
     ulong statm_size, statm_resident, statm_shared, statm_text, statm_lib, statm_data, statm_dt;
     // ----------- above from /proc/[pid]/statm
-    float nv_type, nv_sm_usage, nv_mem_usage, nv_enc_usage, nv_dec_usage;
+    string nv_type;
+    float nv_sm_usage, nv_mem_usage, nv_enc_usage, nv_dec_usage;
     int gpu_memory_used;
-    float disk_read, disk_write, disk_wrapping, disk_io_percent;
     string cmdline;
     float cpu_usage; // cpu usage of process [0, #cores]
     ulong virtual_mem;  // in bytes
-    long mem;  // in bytes
+    long mem, shared_mem, resident_mem;  // in bytes
 };
 struct proc_net_info {
     int pid;
-    float net_send, net_receive;
+    float net_send, net_receive; // in kilobytes
+};
+struct proc_disk_info {
+    int pid;
+    float disk_read, disk_write, disk_canceled_write, disk_iodelay;
 };
 
-struct sys_info sys;
-struct sys_info prev_sys;
+struct sys_info sys = {};
+struct sys_info prev_sys = {};
 map<int, proc_info> procs;
 map<int, proc_net_info> procs_net;
+map<int, proc_disk_info> procs_disk;
 map<int, proc_info> prev_proc;
 
-std::string escape_json(const std::string &s) {
-    std::ostringstream o;
-    for (auto c = s.cbegin(); c != s.cend(); c++) {
-        switch (*c) {
-            case '"':
-                o << "\\\"";
-                break;
-            case '\\':
-                o << "\\\\";
-                break;
-            case '\b':
-                o << "\\b";
-                break;
-            case '\f':
-                o << "\\f";
-                break;
-            case '\n':
-                o << "\\n";
-                break;
-            case '\r':
-                o << "\\r";
-                break;
-            case '\t':
-                o << "\\t";
-                break;
-            default:
-                if ('\x00' <= *c && *c <= '\x1f') {
-                    o << "\\u"
-                      << std::hex << std::setw(4) << std::setfill('0') << (int) *c;
-                } else {
-                    o << *c;
-                }
-        }
-    }
-    return o.str();
-}
 
 sys_info get_sys_info() {
-    sys_info info;
+    sys_info info = {};
     string dummy;
 
     info.clock_ticks = sysconf(_SC_CLK_TCK);
@@ -233,7 +207,7 @@ void get_gpu_info() {
         sys.gpu_graphics_clock = stoi(pt.get<string>("nvidia_smi_log.gpu.clocks.graphics_clock"));
         sys.gpu_sm_clock = stoi(pt.get<string>("nvidia_smi_log.gpu.clocks.sm_clock"));
         sys.gpu_mem_clock = stoi(pt.get<string>("nvidia_smi_log.gpu.clocks.mem_clock"));
-        sys.gpu_video_click = stoi(pt.get<string>("nvidia_smi_log.gpu.clocks.video_clock"));
+        sys.gpu_video_clock = stoi(pt.get<string>("nvidia_smi_log.gpu.clocks.video_clock"));
         for (auto &v : pt.get_child("nvidia_smi_log.gpu.processes")) {
             procs[stoi(v.second.get<string>("pid"))].gpu_memory_used = stoi(v.second.get<string>("used_memory"));
         }
@@ -251,7 +225,8 @@ void get_gpu_info() {
             istringstream iss(line);
             int pid;
             iss >> dummy >> pid;
-            iss >> procs[pid].nv_type >> procs[pid].nv_sm_usage >>procs[pid].nv_mem_usage >>procs[pid].nv_enc_usage >>procs[pid].nv_dec_usage;
+            iss >> procs[pid].nv_type >> procs[pid].nv_sm_usage >> procs[pid].nv_mem_usage >> procs[pid].nv_enc_usage
+                >> procs[pid].nv_dec_usage;
         }
     }
 }
@@ -274,7 +249,7 @@ float calc_cpu(cpu_info &cpu) {
 }
 
 proc_info get_proc_info(int pid) {
-    proc_info info;
+    proc_info info = {};
     string dummy;
 
     ifstream file("/proc/" + to_string(pid) + "/stat");
@@ -365,8 +340,10 @@ float calc_cpu(proc_info &proc) {
 }*/
 
 float calc_mem(proc_info &proc) { // FIXME: minus shared mem
-    proc.mem = proc.rss * sys.page_size;
+    proc.mem = (proc.rss - proc.statm_shared) * sys.page_size;
     proc.virtual_mem = proc.vsize;
+    proc.shared_mem = proc.statm_shared * sys.page_size;
+    proc.resident_mem = proc.rss * sys.page_size;
     return -1;
 }
 
@@ -387,76 +364,192 @@ vector<int> get_pids() {
     return pids;
 }
 
-string generate_json() {
+class json_generator {
+private:
     ostringstream oss;
-    auto json_key = [&](string key) {
+
+    std::string escape_json(const std::string &s) {
+        std::ostringstream o;
+        for (auto c = s.cbegin(); c != s.cend(); c++) {
+            switch (*c) {
+                case '"':
+                    o << "\\\"";
+                    break;
+                case '\\':
+                    o << "\\\\";
+                    break;
+                case '\b':
+                    o << "\\b";
+                    break;
+                case '\f':
+                    o << "\\f";
+                    break;
+                case '\n':
+                    o << "\\n";
+                    break;
+                case '\r':
+                    o << "\\r";
+                    break;
+                case '\t':
+                    o << "\\t";
+                    break;
+                default:
+                    if ('\x00' <= *c && *c <= '\x1f') {
+                        o << "\\u"
+                          << std::hex << std::setw(4) << std::setfill('0') << (int) *c;
+                    } else {
+                        o << *c;
+                    }
+            }
+        }
+        return o.str();
+    }
+
+    string delim;
+public:
+    json_generator() : delim("") {}
+
+    void start() {
+        oss << '{';
+        delim = "";
+    }
+
+    void end() {
+        oss << '}';
+        delim = ",";
+    }
+
+    void key(string key) {
+        oss << delim;
+        delim = ",";
         oss << '"' << key << "\":";
-    };
-    auto json_kv_int = [&](string key, int v) {
+    }
+
+    void kv(string key, long v) {
+        oss << delim;
+        delim = ",";
         oss << '"' << key << "\":" << v;
-    };
-    auto json_kv_float = [&](string key, float v) {
+    }
+
+    void kv(string key, ulong v) {
+        oss << delim;
+        delim = ",";
         oss << '"' << key << "\":" << v;
-    };
-    auto json_kv_string = [&](string key, string v) {
+    }
+
+    void kv(string key, int v) {
+        oss << delim;
+        delim = ",";
+        oss << '"' << key << "\":" << v;
+    }
+
+    void kv(string key, uint v) {
+        oss << delim;
+        delim = ",";
+        oss << '"' << key << "\":" << v;
+    }
+
+    void kv(string key, float v) {
+        oss << delim;
+        delim = ",";
+        oss << '"' << key << "\":" << fixed << setprecision(8) << v;
+    }
+
+    void kv(string key, string v) {
+        oss << delim;
+        delim = ",";
         oss << '"' << key << "\":" << '"' << escape_json(v) << '"';
-    };
-    oss << '{';
-    json_key("sys");
+    }
+
+    string str() {
+        return "{" + oss.str() + "}";
+    }
+};
+
+string generate_json() {
+    json_generator json;
+    json.key("sys");
+    json.start();
     {
-        oss << '{';
-        json_kv_int("MemTotal", sys.MemTotal);
-        oss << ',';
-        json_kv_int("MemAvailable", sys.MemAvailable);
-        oss << ',';
-        json_kv_int("SwapTotal", sys.SwapTotal);
-        oss << ',';
-        json_kv_int("SwapFree", sys.SwapFree);
-        oss << ',';
-        json_key("cpus");
+        json.kv("MemTotal", sys.MemTotal);
+        json.kv("MemAvailable", sys.MemAvailable);
+        json.kv("SwapTotal", sys.SwapTotal);
+        json.kv("SwapFree", sys.SwapFree);
+
+        json.kv("gpu_name", sys.gpu_name);
+        json.kv("gpu_fan_speed", sys.gpu_fan_speed);
+        json.kv("gpu_memory_total", sys.gpu_memory_total);
+        json.kv("gpu_memory_free", sys.gpu_memory_free);
+        json.kv("gpu_shared_memory_total", sys.gpu_shared_memory_total);
+        json.kv("gpu_shared_memory_free", sys.gpu_shared_memory_free);
+        json.kv("nv_gpu_usage", sys.nv_gpu_usage);
+        json.kv("nv_mem_usage", sys.nv_mem_usage);
+        json.kv("nv_enc_usage", sys.nv_enc_usage);
+        json.kv("nv_dec_usage", sys.nv_dec_usage);
+        json.kv("gpu_temp", sys.gpu_temp);
+        json.kv("gpu_power_draw", sys.gpu_power_draw);
+        json.kv("gpu_power_limit", sys.gpu_power_limit);
+        json.kv("gpu_graphics_clock", sys.gpu_graphics_clock);
+        json.kv("gpu_sm_clock", sys.gpu_sm_clock);
+        json.kv("gpu_mem_clock", sys.gpu_mem_clock);
+        json.kv("gpu_video_clock", sys.gpu_video_clock);
+
+        json.key("cpus");
+        json.start();
         {
-            oss << '{';
-            string delim = "";
             for (auto &kv: sys.cpus) {
-                oss << delim;
-                delim = ",";
-                json_kv_float(kv.first, kv.second.usage);
+                json.kv(kv.first, kv.second.usage);
             }
-            oss << '}';
         }
-        oss << '}';
+        json.end();
     }
-    oss << ',';
-    json_key("proc");
+    json.end();
+    json.key("proc");
+    json.start();
     {
-        oss << '{';
-        string delim = "";
         for (auto &kv: procs) {
-            oss << delim;
-            delim = ",";
             int pid = kv.first;
-            json_key(to_string(pid));
+            json.key(to_string(pid));
+            json.start();
             {
-                oss << '{';
                 proc_info proc = kv.second;
-                json_kv_int("ppid", proc.ppid);
-                oss << ',';
-                json_kv_string("comm", proc.comm); // danger
-                oss << ',';
-                json_kv_string("cmdline", proc.cmdline); // danger
-                oss << ',';
-                json_kv_int("mem", proc.mem);
-                oss << ',';
-                json_kv_int("virtual_mem", proc.virtual_mem);
-                oss << ',';
-                json_kv_float("cpu_usage", proc.cpu_usage);
-                oss << '}';
+                json.kv("ppid", proc.ppid);
+                json.kv("comm", proc.comm);
+                json.kv("cmdline", proc.cmdline);
+                json.kv("mem", proc.mem);
+                json.kv("shared_mem", proc.shared_mem);
+                json.kv("resident_mem", proc.resident_mem);
+                json.kv("virtual_mem", proc.virtual_mem);
+                json.kv("cpu_usage", proc.cpu_usage);
+
+                json.kv("nv_type", proc.nv_type);
+                json.kv("nv_sm_usage", proc.nv_sm_usage);
+                json.kv("nv_mem_usage", proc.nv_mem_usage);
+                json.kv("nv_enc_usage", proc.nv_enc_usage);
+                json.kv("nv_dec_usage", proc.nv_dec_usage);
+                json.kv("gpu_memory_used", proc.gpu_memory_used);
+
+                if (procs_net.find(pid) != procs_net.end()) {
+                    json.kv("net_receive", procs_net[pid].net_receive);
+                    json.kv("net_send", procs_net[pid].net_send);
+                } else {
+                    json.kv("net_receive", 0);
+                    json.kv("net_send", 0);
+                }
+
+                if (procs_disk.find(pid) != procs_disk.end()) {
+                    json.kv("disk_read", procs_disk[pid].disk_read);
+                    json.kv("disk_write", procs_disk[pid].disk_write);
+                } else {
+                    json.kv("disk_read", 0);
+                    json.kv("disk_write", 0);
+                }
             }
+            json.end();
         }
-        oss << '}';
     }
-    oss << '}';
-    return oss.str();
+    json.end();
+    return json.str();
 }
 
 void query() {
@@ -465,6 +558,7 @@ void query() {
         calc_cpu(kv.second);
     }
     vector<int> pids = get_pids();
+    procs.clear();
     for (int &pid : pids) {
         proc_info proc = get_proc_info(pid);
         calc_cpu(proc);
@@ -480,38 +574,12 @@ void query() {
     prev_sys = sys;
 }
 
-
-/*int main() {
-    asio::io_service ios;
-    std::vector<char> buf;
-
-    bp::async_pipe ap(ios);
-    bp::child c("nethogs -t", bp::std_out > ap, bp::std_err > bp::null, ios);
-//    bp::child c("iotop -Pbok", bp::std_out > pipe_stream);
-//    bp::child c("nvidia-smi -x -q", bp::std_out > pipe_stream);
-//    bp::child c("nvidia-smi pmon -c 1", bp::std_out > ap);
-
-    ap.async_read_some(asio::buffer(buf), [](auto &ec, auto size){cout << ec.message() << endl;});
-
-    ios.run();
-    c.wait();
-    for (char c : buf) {
-        cout << c;
-    }
-
-    while (true) {
-        query();
-        sleep(1);
-    }
-    return 0;
-}*/
-
 class spawn_process {
 private:
     bp::async_pipe output;
     bp::child child;
     asio::streambuf buffer;
-    function<void(istream&)> handler;
+    function<void(istream &)> handler;
 public:
     void readloop() {
         asio::async_read_until(output, buffer, '\n', [&](boost::system::error_code ec, size_t transferred) {
@@ -526,7 +594,9 @@ public:
             }
         });
     }
-    spawn_process(const string &cmd, function<void(istream&)> handler, asio::io_service &ios) : output(ios), child(cmd, bp::std_out > output, bp::std_err > bp::null, ios), handler(handler) {
+
+    spawn_process(const string &cmd, function<void(istream &)> handler, asio::io_service &ios) :
+            output(ios), child(cmd, bp::std_out > output, bp::std_err > bp::null, ios), handler(handler) {
         readloop();
     }
 };
@@ -548,7 +618,7 @@ int main() {
             if (line.empty()) {
                 return;
             }
-            proc_net_info proc_net;
+            proc_net_info proc_net = {};
             vector<string> parts;
             b::split(parts, line, b::is_any_of("/"));
             int pid = stoi(parts[parts.size() - 2]);
@@ -563,9 +633,26 @@ int main() {
         }
 //        cout << "!!!!!!" << line << endl;
     }, io);
-    spawn_process iotop("iotop -Pbk", [&](istream &is) {
+    spawn_process iotop("pidstat -dlhH 1", [&, first_refresh = false](istream &is) mutable {
         string line;
         getline(is, line);
+        if (line[0] == '#') {
+            procs_disk.clear();
+            first_refresh = true;
+        }
+        if (first_refresh) {
+            if (line[0] == '#') {
+                return;
+            }
+            if (line.empty()) {
+                return;
+            }
+            proc_disk_info proc_disk = {};
+            string dummy;
+            istringstream iss(line);
+            iss >> dummy >> dummy >> proc_disk.pid >> proc_disk.disk_read >> proc_disk.disk_write >> proc_disk.disk_canceled_write >> proc_disk.disk_iodelay;
+            procs_disk[proc_disk.pid] = proc_disk;
+        }
 //        cout << "####" << line << endl;
     }, io);
 
