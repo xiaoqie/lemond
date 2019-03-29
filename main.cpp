@@ -1,6 +1,3 @@
-/**
- * I want to monitor: CPU Memory Disk Network GPU
- */
 #include <string>
 #include <iostream>
 #include <fstream>
@@ -16,92 +13,30 @@
 #include <iomanip>
 #include <unistd.h>
 #include <sys/sysinfo.h>
-#include <boost/process.hpp>
-#include <boost/process/async.hpp>
-#include <boost/asio/high_resolution_timer.hpp>
-#include <boost/asio/steady_timer.hpp>
+#include <sys/stat.h>
 #include <boost/asio.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
+#include "main.h"
+#include "json.h"
+#include "spawn.h"
+#include "timer.h"
+#include "ws.h"
+#include "systemd.h"
+#include "user.h"
 
 using namespace std;
 namespace fs = filesystem;
+namespace b = boost;
 namespace bp = boost::process;
 namespace asio = boost::asio;
-namespace b = boost;
 namespace pt = b::property_tree;
-typedef unsigned long long ulonglong;
+using tcp = boost::asio::ip::tcp;
 
-struct cpu_info {
-    string name;
-    ulong idle;
-    float usage;
-};
-
-struct sys_info {
-    float uptime;
-    int clock_ticks;
-    int page_size;
-    ulong MemTotal, MemFree, MemAvailable, Buffers, Cached, SwapCached, Active, Inactive, Active_anon, Inactive_anon,
-            Active_file, Inactive_file, Unevictable, Mlocked, SwapTotal, SwapFree, Dirty, Writeback, AnonPages,
-            Mapped, Shmem, Slab, SReclaimable, SUnreclaim, KernelStack, PageTables, NFS_Unstable, Bounce, WritebackTmp,
-            CommitLimit, Committed_AS, VmallocTotal, VmallocUsed, VmallocChunk, HardwareCorrupted, AnonHugePages,
-            ShmemHugePages, ShmemPmdMapped, CmaTotal, CmaFree, HugePages_Total, HugePages_Free, HugePages_Rsvd,
-            HugePages_Surp, Hugepagesize, DirectMap4k, DirectMap2M, DirectMap1G;
-    // ----------------------------
-    string gpu_name;
-    float gpu_fan_speed;
-    uint gpu_memory_total, gpu_memory_free, gpu_shared_memory_total, gpu_shared_memory_free;
-    float nv_gpu_usage, nv_mem_usage, nv_enc_usage, nv_dec_usage;
-    int gpu_temp;
-    float gpu_power_draw, gpu_power_limit;
-    int gpu_graphics_clock, gpu_sm_clock, gpu_mem_clock, gpu_video_clock;
-
-    // ----------------------------
-    map<string, cpu_info> cpus;
-};
-
-struct proc_info {
-    int pid;
-    string comm;
-    char state;
-    int ppid, pgrp, session, tty_nr, tpgid;
-    uint flags;
-    ulong minflt, cminflt, majflt, cmajflt, utime, stime;
-    long cutime, cstime, priority, nice, num_threads, itrealvalue;
-    ulonglong starttime;
-    ulong vsize;
-    long rss;
-    ulong rsslim, startcode, endcode, startstack, kstkesp, kstkeip, signal, blocked,
-            sigignore, sigcatch, wchan, nswap, cnswap;
-    int exit_signal, processor;
-    uint rt_priority, policy;
-    ulonglong delayacct_blkio_ticks;
-    ulong guest_time;
-    uint cguest_time;
-    ulong start_data, end_data, start_brk, arg_start, arg_end, env_start, env_end;
-    int exit_code;
-    // ----------- above from /proc/[pid]/stat ------------
-    ulong statm_size, statm_resident, statm_shared, statm_text, statm_lib, statm_data, statm_dt;
-    // ----------- above from /proc/[pid]/statm
-    string nv_type;
-    float nv_sm_usage, nv_mem_usage, nv_enc_usage, nv_dec_usage;
-    int gpu_memory_used;
-    string cmdline;
-    float cpu_usage; // cpu usage of process [0, #cores]
-    ulong virtual_mem;  // in bytes
-    long mem, shared_mem, resident_mem;  // in bytes
-};
-struct proc_net_info {
-    int pid;
-    float net_send, net_receive; // in kilobytes
-};
-struct proc_disk_info {
-    int pid;
-    float disk_read, disk_write, disk_canceled_write, disk_iodelay;
-};
-
+string systemd_units;
+vector<user> users;
+vector<string> shells;
 struct sys_info sys = {};
 struct sys_info prev_sys = {};
 map<int, proc_info> procs;
@@ -180,16 +115,89 @@ sys_info get_sys_info() {
         iss >> cpu.name >> dummy >> dummy >> dummy >> cpu.idle;
         info.cpus[cpu.name] = cpu;
     }
+    info.ncpus = max(static_cast<int>(info.cpus.size()) - 1, 1);
 
+    return info;
+}
+
+proc_info get_proc_info(int pid) {
+    proc_info info = {};
+    string dummy;
+
+    struct stat filestat;
+    if (stat(("/proc/" + to_string(pid)).c_str(), &filestat)) {
+        info.uid = filestat.st_uid;
+    }
+
+    ifstream file("/proc/" + to_string(pid) + "/stat");
+    file >> info.pid;
+    getline(file, info.comm, ')');
+    info.comm += ')';
+    info.comm = info.comm.substr(1);
+    file >> info.state >> info.ppid >> info.pgrp >> info.session >> info.tty_nr >> info.tpgid
+         >> info.flags >> info.minflt >> info.cminflt >> info.majflt >> info.cmajflt >> info.utime >> info.stime
+         >> info.cutime >> info.cstime >> info.priority >> info.nice >> info.num_threads >> info.itrealvalue
+         >> info.starttime >> info.vsize >> info.rss >> info.rsslim >> info.startcode >> info.endcode >> info.startstack
+         >> info.kstkesp >> info.kstkeip >> info.signal >> info.blocked >> info.sigignore >> info.sigcatch >> info.wchan
+         >> info.nswap >> info.cnswap >> info.exit_signal >> info.processor >> info.rt_priority >> info.policy
+         >> info.delayacct_blkio_ticks >> info.guest_time >> info.cguest_time >> info.start_data >> info.end_data
+         >> info.start_brk >> info.arg_start >> info.arg_end >> info.env_start >> info.env_end >> info.exit_code;
+
+    file = ifstream("/proc/" + to_string(pid) + "/statm");
+    file >> info.statm_size >> info.statm_resident >> info.statm_shared >> info.statm_text >> info.statm_lib
+         >> info.statm_data >> info.statm_dt;
+
+    file = ifstream("/proc/" + to_string(pid) + "/cmdline");
+    getline(file, info.cmdline);
+    for (char & i : info.cmdline)
+        if (i == '\0')
+            i = ' ';
+
+    file = ifstream("/proc/" + to_string(pid) + "/cgroup");
+    string line;
+    while (getline(file, line)) {
+        if (line[0] == '0') {
+            //vector<string> parts;
+            //b::split(parts, line, b::is_any_of("/"));
+            //info.cgroup = parts[parts.size() - 1];
+            info.cgroup = line.substr(3);
+            break;
+        }
+    }
+
+    try {
+        fs::path p = "/proc/" + to_string(pid) + "/cwd";
+        if(fs::exists(p) && fs::is_symlink(p)) {
+            error_code ec;
+                fs::path target = fs::read_symlink(p);
+                info.cwd = target;
+        }
+    } catch (fs::filesystem_error &e) {
+        info.cwd = "";
+    }
+    try {
+        fs::path p = "/proc/" + to_string(pid) + "/exe";
+        if(fs::exists(p) && fs::is_symlink(p)) {
+            error_code ec;
+                fs::path target = fs::read_symlink(p);
+                info.exe = target;
+        }
+    } catch (fs::filesystem_error &e) {
+        info.exe = "";
+    }
 
     return info;
 }
 
 void get_gpu_info() {
     {
+        // pt::ptree pt;
+        // bp::ipstream is;
+        // bp::child c("nvidia-smi -x -q", bp::std_out > is);
+        // pt::read_xml(is, pt);
+
+        istringstream is(exec("nvidia-smi -x -q"));
         pt::ptree pt;
-        bp::ipstream is;
-        bp::child c("nvidia-smi -x -q", bp::std_out > is);
         pt::read_xml(is, pt);
         sys.gpu_name = pt.get<string>("nvidia_smi_log.gpu.product_name");
         sys.gpu_fan_speed = stof(pt.get<string>("nvidia_smi_log.gpu.fan_speed"));
@@ -211,23 +219,26 @@ void get_gpu_info() {
         for (auto &v : pt.get_child("nvidia_smi_log.gpu.processes")) {
             procs[stoi(v.second.get<string>("pid"))].gpu_memory_used = stoi(v.second.get<string>("used_memory"));
         }
-        c.wait();
+        // c.wait();
+
     }
     {
-        pt::ptree pt;
-        bp::ipstream is;
+        // pt::ptree pt;
+        // bp::ipstream is;
         string line;
         string dummy;
-        bp::child c("nvidia-smi pmon -c 1", bp::std_out > is);
+        // bp::child c("nvidia-smi pmon -c 1", bp::std_out > is);
+        istringstream is(exec("nvidia-smi pmon -c 1"));
         getline(is, line);  // two dummy lines
         getline(is, line);
-        while (c.running() && getline(is, line)) {
+        while (/* c.running() && */ getline(is, line)) {
             istringstream iss(line);
             int pid;
             iss >> dummy >> pid;
             iss >> procs[pid].nv_type >> procs[pid].nv_sm_usage >> procs[pid].nv_mem_usage >> procs[pid].nv_enc_usage
                 >> procs[pid].nv_dec_usage;
         }
+        // c.wait();
     }
 }
 
@@ -248,43 +259,6 @@ float calc_cpu(cpu_info &cpu) {
     return max_usage - idle_usage;
 }
 
-proc_info get_proc_info(int pid) {
-    proc_info info = {};
-    string dummy;
-
-    ifstream file("/proc/" + to_string(pid) + "/stat");
-    file >> info.pid >> info.comm >> info.state >> info.ppid >> info.pgrp >> info.session >> info.tty_nr >> info.tpgid
-         >> info.flags >> info.minflt >> info.cminflt >> info.majflt >> info.cmajflt >> info.utime >> info.stime
-         >> info.cutime >> info.cstime >> info.priority >> info.nice >> info.num_threads >> info.itrealvalue
-         >> info.starttime >> info.vsize >> info.rss >> info.rsslim >> info.startcode >> info.endcode >> info.startstack
-         >> info.kstkesp >> info.kstkeip >> info.signal >> info.blocked >> info.sigignore >> info.sigcatch >> info.wchan
-         >> info.nswap >> info.cnswap >> info.exit_signal >> info.processor >> info.rt_priority >> info.policy
-         >> info.delayacct_blkio_ticks >> info.guest_time >> info.cguest_time >> info.start_data >> info.end_data
-         >> info.start_brk >> info.arg_start >> info.arg_end >> info.env_start >> info.env_end >> info.exit_code;
-
-/*    file = ifstream("/proc/" + to_string(pid) + "/io");
-    file >>
-         dummy >> info.rchar >>
-         dummy >> info.wchan >>
-         dummy >> info.syscr >>
-         dummy >> info.syscw >>
-         dummy >> info.read_bytes >>
-         dummy >> info.write_bytes >>
-         dummy >> info.cancelled_write_bytes;*/
-
-    file = ifstream("/proc/" + to_string(pid) + "/statm");
-    file >> info.statm_size >> info.statm_resident >> info.statm_shared >> info.statm_text >> info.statm_lib
-         >> info.statm_data >> info.statm_dt;
-
-    file = ifstream("/proc/" + to_string(pid) + "/cmdline");
-    getline(file, info.cmdline);
-    for (int i = 0; i < info.cmdline.length(); ++i)
-        if (info.cmdline[i] == '\0')
-            info.cmdline[i] = ' ';
-
-    return info;
-}
-
 float calc_cpu(proc_info &proc) {
     float prev_uptime = proc.starttime / sys.clock_ticks;
     ulong prev_totaltime = 0;
@@ -298,47 +272,6 @@ float calc_cpu(proc_info &proc) {
     return cpu_usage;
 }
 
-/*float calc_io(proc_info &proc) {
-    ulong prev_read = 0;
-    ulong prev_write = 0;
-    float prev_uptime = proc.starttime / sys.clock_ticks;
-    if (prev_proc.find(proc.pid) != prev_proc.end()) {
-        prev_uptime = prev_sys.uptime;
-        prev_read = prev_proc[proc.pid].read_bytes;
-        prev_write = prev_proc[proc.pid].write_bytes;
-    }
-    float uptime = sys.uptime;
-    ulong read = proc.read_bytes;
-    ulong write = proc.write_bytes;
-    proc.io_read_speed = (read - prev_read) / (uptime - prev_uptime);
-    proc.io_write_speed = (write - prev_write) / (uptime - prev_uptime);
-    return -1;
-}*/
-
-/*float calc_net() {
-    sys.io_receive_speed = 0;
-    sys.io_transmit_speed = 0;
-    for (const auto &kv : sys.net_devs) {
-        net_dev dev = kv.second;
-        if (dev.interface == "lo:") continue;  // loopback device doesn't count
-        cout << dev.interface;
-        ulong prev_receive = 0;
-        ulong prev_transmit = 0;
-        float prev_uptime = 0;
-        if (prev_sys.net_devs.find(dev.interface) != prev_sys.net_devs.end()) {
-            prev_receive = prev_sys.net_devs[dev.interface].receive_bytes;
-            prev_transmit = prev_sys.net_devs[dev.interface].transmit_bytes;
-            prev_uptime = prev_sys.uptime;
-        }
-        float uptime = sys.uptime;
-        ulong receive = dev.receive_bytes;
-        ulong transmit = dev.transmit_bytes;
-        sys.io_receive_speed += (receive - prev_receive) / (uptime - prev_uptime);
-        sys.io_transmit_speed += (transmit - prev_transmit) / (uptime - prev_uptime);
-    }
-    return -1;
-}*/
-
 float calc_mem(proc_info &proc) { // FIXME: minus shared mem
     proc.mem = (proc.rss - proc.statm_shared) * sys.page_size;
     proc.virtual_mem = proc.vsize;
@@ -349,8 +282,7 @@ float calc_mem(proc_info &proc) { // FIXME: minus shared mem
 
 vector<int> get_pids() {
     vector<int> pids;
-    string path = "/proc";
-    for (auto &p : fs::directory_iterator(path)) {
+    for (auto &p : fs::directory_iterator("/proc")) {
         string path = p.path();
         string filename = path.substr(path.find_last_of('/') + 1);
         int pid = -1;
@@ -363,108 +295,6 @@ vector<int> get_pids() {
     }
     return pids;
 }
-
-class json_generator {
-private:
-    ostringstream oss;
-
-    std::string escape_json(const std::string &s) {
-        std::ostringstream o;
-        for (auto c = s.cbegin(); c != s.cend(); c++) {
-            switch (*c) {
-                case '"':
-                    o << "\\\"";
-                    break;
-                case '\\':
-                    o << "\\\\";
-                    break;
-                case '\b':
-                    o << "\\b";
-                    break;
-                case '\f':
-                    o << "\\f";
-                    break;
-                case '\n':
-                    o << "\\n";
-                    break;
-                case '\r':
-                    o << "\\r";
-                    break;
-                case '\t':
-                    o << "\\t";
-                    break;
-                default:
-                    if ('\x00' <= *c && *c <= '\x1f') {
-                        o << "\\u"
-                          << std::hex << std::setw(4) << std::setfill('0') << (int) *c;
-                    } else {
-                        o << *c;
-                    }
-            }
-        }
-        return o.str();
-    }
-
-    string delim;
-public:
-    json_generator() : delim("") {}
-
-    void start() {
-        oss << '{';
-        delim = "";
-    }
-
-    void end() {
-        oss << '}';
-        delim = ",";
-    }
-
-    void key(string key) {
-        oss << delim;
-        delim = ",";
-        oss << '"' << key << "\":";
-    }
-
-    void kv(string key, long v) {
-        oss << delim;
-        delim = ",";
-        oss << '"' << key << "\":" << v;
-    }
-
-    void kv(string key, ulong v) {
-        oss << delim;
-        delim = ",";
-        oss << '"' << key << "\":" << v;
-    }
-
-    void kv(string key, int v) {
-        oss << delim;
-        delim = ",";
-        oss << '"' << key << "\":" << v;
-    }
-
-    void kv(string key, uint v) {
-        oss << delim;
-        delim = ",";
-        oss << '"' << key << "\":" << v;
-    }
-
-    void kv(string key, float v) {
-        oss << delim;
-        delim = ",";
-        oss << '"' << key << "\":" << fixed << setprecision(8) << v;
-    }
-
-    void kv(string key, string v) {
-        oss << delim;
-        delim = ",";
-        oss << '"' << key << "\":" << '"' << escape_json(v) << '"';
-    }
-
-    string str() {
-        return "{" + oss.str() + "}";
-    }
-};
 
 string generate_json() {
     json_generator json;
@@ -494,6 +324,7 @@ string generate_json() {
         json.kv("gpu_mem_clock", sys.gpu_mem_clock);
         json.kv("gpu_video_clock", sys.gpu_video_clock);
 
+        json.kv("ncpus", sys.ncpus);
         json.key("cpus");
         json.start();
         {
@@ -504,6 +335,29 @@ string generate_json() {
         json.end();
     }
     json.end();
+
+    json.key("systemd_units");
+    json.raw_value(systemd_units);
+
+    json.key("user");
+    json.list_start();
+    for (auto &u: users) {
+        json.list_entry();
+        json.start();
+        json.kv("uid", u.uid);
+        json.kv("gid", u.gid);
+        json.kv("name", u.name);
+        json.end();
+    }
+    json.list_end();
+
+    json.key("shell");
+    json.list_start();
+    for (auto &s: shells) {
+        json.list_entry(s);
+    }
+    json.list_end();
+
     json.key("proc");
     json.start();
     {
@@ -513,6 +367,7 @@ string generate_json() {
             json.start();
             {
                 proc_info proc = kv.second;
+                json.kv("pid", pid);
                 json.kv("ppid", proc.ppid);
                 json.kv("comm", proc.comm);
                 json.kv("cmdline", proc.cmdline);
@@ -528,6 +383,11 @@ string generate_json() {
                 json.kv("nv_enc_usage", proc.nv_enc_usage);
                 json.kv("nv_dec_usage", proc.nv_dec_usage);
                 json.kv("gpu_memory_used", proc.gpu_memory_used);
+
+                json.kv("cgroup", proc.cgroup);
+                json.kv("cwd", proc.cwd);
+                json.kv("exe", proc.exe);
+                json.kv("uid", proc.uid);
 
                 if (procs_net.find(pid) != procs_net.end()) {
                     json.kv("net_receive", procs_net[pid].net_receive);
@@ -568,102 +428,86 @@ void query() {
 
     get_gpu_info();
 
-    cout << generate_json() << endl;
+    string json = generate_json();
+//    cout << json << endl;
+    for (auto &s: get_sessions()) {
+        s->write(json);
+    }
 
     prev_proc = procs;
     prev_sys = sys;
 }
 
-class spawn_process {
-private:
-    bp::async_pipe output;
-    bp::child child;
-    asio::streambuf buffer;
-    function<void(istream &)> handler;
-public:
-    void readloop() {
-        asio::async_read_until(output, buffer, '\n', [&](boost::system::error_code ec, size_t transferred) {
-            if (transferred) {
-                std::istream is(&buffer);
-                handler(is);
-            }
-            if (ec) {
-                std::cerr << "Output pipe: " << ec.message() << std::endl;
-            } else {
-                readloop();
-            }
-        });
-    }
-
-    spawn_process(const string &cmd, function<void(istream &)> handler, asio::io_service &ios) :
-            output(ios), child(cmd, bp::std_out > output, bp::std_err > bp::null, ios), handler(handler) {
-        readloop();
-    }
-};
 
 int main() {
-    boost::asio::io_service io;
-    spawn_process nethogs("nethogs -t", [&, first_refresh = false](istream &is) mutable {
-        string line;
-        getline(is, line);
+    try {
+        systemd_units = systemd_list_units();
+        users = get_users();
+        shells = get_shells();
+        boost::asio::io_service io;
+
+        spawn_process nethogs("nethogs -t", [&, first_refresh = false](istream &is) mutable {
+            string line;
+            getline(is, line);
 //        cout << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()).time_since_epoch()).count() << ':' << line << endl;
-        if (line == "Refreshing:") {
-            procs_net.clear();
-            first_refresh = true;
-        }
-        if (first_refresh) {
             if (line == "Refreshing:") {
-                return;
+                procs_net.clear();
+                first_refresh = true;
             }
-            if (line.empty()) {
-                return;
-            }
-            proc_net_info proc_net = {};
-            vector<string> parts;
-            b::split(parts, line, b::is_any_of("/"));
-            int pid = stoi(parts[parts.size() - 2]);
-            if (pid == 0) {
-                return;
-            }
+            if (first_refresh) {
+                if (line == "Refreshing:") {
+                    return;
+                }
+                if (line.empty()) {
+                    return;
+                }
+                proc_net_info proc_net = {};
+                vector<string> parts;
+                b::split(parts, line, b::is_any_of("/"));
+                int pid = stoi(parts[parts.size() - 2]);
+                if (pid == 0) {
+                    return;
+                }
 
-            istringstream iss(parts[parts.size() - 1]);
-            string dummy;
-            iss >> dummy >> proc_net.net_send >> proc_net.net_receive;
-            procs_net[pid] = proc_net;
-        }
-//        cout << "!!!!!!" << line << endl;
-    }, io);
-    spawn_process iotop("pidstat -dlhH 1", [&, first_refresh = false](istream &is) mutable {
-        string line;
-        getline(is, line);
-        if (line[0] == '#') {
-            procs_disk.clear();
-            first_refresh = true;
-        }
-        if (first_refresh) {
+                istringstream iss(parts[parts.size() - 1]);
+                string dummy;
+                iss >> dummy >> proc_net.net_send >> proc_net.net_receive;
+                procs_net[pid] = proc_net;
+            }
+        }, io);
+        spawn_process iotop("pidstat -dlhH 1", [&, first_refresh = false](istream &is) mutable {
+            string line;
+            getline(is, line);
             if (line[0] == '#') {
-                return;
+                procs_disk.clear();
+                first_refresh = true;
             }
-            if (line.empty()) {
-                return;
+            if (first_refresh) {
+                if (line[0] == '#') {
+                    return;
+                }
+                if (line.empty()) {
+                    return;
+                }
+                proc_disk_info proc_disk = {};
+                string dummy;
+                istringstream iss(line);
+                iss >> dummy >> dummy >> proc_disk.pid >> proc_disk.disk_read >> proc_disk.disk_write
+                    >> proc_disk.disk_canceled_write >> proc_disk.disk_iodelay;
+                procs_disk[proc_disk.pid] = proc_disk;
             }
-            proc_disk_info proc_disk = {};
-            string dummy;
-            istringstream iss(line);
-            iss >> dummy >> dummy >> proc_disk.pid >> proc_disk.disk_read >> proc_disk.disk_write >> proc_disk.disk_canceled_write >> proc_disk.disk_iodelay;
-            procs_disk[proc_disk.pid] = proc_disk;
-        }
-//        cout << "####" << line << endl;
-    }, io);
+        }, io);
 
-    asio::steady_timer t(io, chrono::seconds(1));
-    std::function<void()> queryloop = [&]() {
-        t.async_wait([&](auto &ec) {
+        timer t(1, io, [&]() {
             query();
-            t.expires_at(t.expires_at() + chrono::seconds(1));
-            queryloop();
         });
-    };
-    queryloop();
-    io.run();
+
+        auto const address = asio::ip::make_address("127.0.0.1");
+        auto const port = static_cast<unsigned short>(8089);
+        make_shared<listener>(io, tcp::endpoint(address, port))->run();
+
+        io.run();
+    } catch (const exception &e) {
+        cout << e.what() << endl;
+    }
 }
