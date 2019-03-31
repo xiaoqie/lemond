@@ -35,6 +35,7 @@ namespace pt = b::property_tree;
 using tcp = boost::asio::ip::tcp;
 
 string systemd_units;
+string lsblk;
 vector<user> users;
 vector<string> shells;
 struct sys_info sys = {};
@@ -44,6 +45,51 @@ map<int, proc_net_info> procs_net;
 map<int, proc_disk_info> procs_disk;
 map<int, proc_info> prev_proc;
 
+map<string, diskstat> get_diskstats() {
+    map<string, diskstat> diskstats;
+    ifstream file("/proc/diskstats");
+    string line;
+    string dummy;
+    while (getline(file, line)) {
+        istringstream iss(line);
+        diskstat d;
+        iss >> dummy >> dummy >> d.name >>
+            d.reads_completed >> d.reads_merged >> d.sectors_read >> d.time_read >>
+            d.writes_completed >> d.writes_merged >> d.sectors_written >> d.time_write >>
+            d.io_in_progress >> d.time_io >> d.weighted_time_io;
+        diskstats[d.name] = d;
+    }
+    return diskstats;
+}
+
+map<string, net_dev> get_net_devs() {
+    map<string, net_dev> net_devs;
+    ifstream file("/proc/net/dev");
+    string line;
+    getline(file, line);
+    getline(file, line);
+    string dummy;
+    while (getline(file, line)) {
+        istringstream iss(line);
+        net_dev d = {};
+        iss >> d.interface
+            >> d.receive_bytes >> d.receive_packets >> d.receive_errs >> d.receive_drop >> d.receive_fifo
+            >> d.receive_frame >> d.receive_compressed >> d.receive_multicast
+            >> d.transmit_bytes >> d.transmit_packets >> d.transmit_errs >> d.transmit_drop >> d.transmit_fifo
+            >> d.transmit_colls >> d.transmit_carrier >> d.transmit_compressed;
+        net_devs[d.interface] = d;
+    }
+    return net_devs;
+}
+
+void calc_disk(diskstat &disk) {
+    if (prev_sys.diskstats.find(disk.name) != prev_sys.diskstats.end()) {
+        diskstat &prev = prev_sys.diskstats[disk.name];
+        disk.usage = (disk.time_io - prev.time_io) / 1000.0;
+    } else {
+        disk.usage = disk.time_io / sys.uptime;
+    }
+}
 
 sys_info get_sys_info() {
     sys_info info = {};
@@ -117,6 +163,8 @@ sys_info get_sys_info() {
     }
     info.ncpus = max(static_cast<int>(info.cpus.size()) - 1, 1);
 
+    info.diskstats = get_diskstats();
+
     return info;
 }
 
@@ -149,7 +197,7 @@ proc_info get_proc_info(int pid) {
 
     file = ifstream("/proc/" + to_string(pid) + "/cmdline");
     getline(file, info.cmdline);
-    for (char & i : info.cmdline)
+    for (char &i : info.cmdline)
         if (i == '\0')
             i = ' ';
 
@@ -167,20 +215,20 @@ proc_info get_proc_info(int pid) {
 
     try {
         fs::path p = "/proc/" + to_string(pid) + "/cwd";
-        if(fs::exists(p) && fs::is_symlink(p)) {
+        if (fs::exists(p) && fs::is_symlink(p)) {
             error_code ec;
-                fs::path target = fs::read_symlink(p);
-                info.cwd = target;
+            fs::path target = fs::read_symlink(p);
+            info.cwd = target;
         }
     } catch (fs::filesystem_error &e) {
         info.cwd = "";
     }
     try {
         fs::path p = "/proc/" + to_string(pid) + "/exe";
-        if(fs::exists(p) && fs::is_symlink(p)) {
+        if (fs::exists(p) && fs::is_symlink(p)) {
             error_code ec;
-                fs::path target = fs::read_symlink(p);
-                info.exe = target;
+            fs::path target = fs::read_symlink(p);
+            info.exe = target;
         }
     } catch (fs::filesystem_error &e) {
         info.exe = "";
@@ -280,6 +328,29 @@ float calc_mem(proc_info &proc) { // FIXME: minus shared mem
     return -1;
 }
 
+float calc_net() {
+    sys.net_receive_speed = 0;
+    sys.net_transmit_speed = 0;
+    for (const auto &kv : sys.net_devs) {
+        net_dev dev = kv.second;
+        if (dev.interface == "lo:") continue;  // loopback device doesn't count
+        ulong prev_receive = 0;
+        ulong prev_transmit = 0;
+        float prev_uptime = 0;
+        if (prev_sys.net_devs.find(dev.interface) != prev_sys.net_devs.end()) {
+            prev_receive = prev_sys.net_devs[dev.interface].receive_bytes;
+            prev_transmit = prev_sys.net_devs[dev.interface].transmit_bytes;
+            prev_uptime = prev_sys.uptime;
+        }
+        float uptime = sys.uptime;
+        ulong receive = dev.receive_bytes;
+        ulong transmit = dev.transmit_bytes;
+        sys.net_receive_speed += (receive - prev_receive) / (uptime - prev_uptime);
+        sys.net_transmit_speed += (transmit - prev_transmit) / (uptime - prev_uptime);
+    }
+    return -1;
+}
+
 vector<int> get_pids() {
     vector<int> pids;
     for (auto &p : fs::directory_iterator("/proc")) {
@@ -324,6 +395,9 @@ string generate_json() {
         json.kv("gpu_mem_clock", sys.gpu_mem_clock);
         json.kv("gpu_video_clock", sys.gpu_video_clock);
 
+        json.kv("net_receive_speed", sys.net_receive_speed);
+        json.kv("net_transmit_speed", sys.net_transmit_speed);
+
         json.kv("ncpus", sys.ncpus);
         json.key("cpus");
         json.start();
@@ -333,13 +407,30 @@ string generate_json() {
             }
         }
         json.end();
+
+        json.key("diskstats");
+        json.start();
+        {
+            for (auto &kv: sys.diskstats) {
+                json.key(kv.first);
+                json.start();
+                json.kv("sectors_read", kv.second.sectors_read);
+                json.kv("sectors_written", kv.second.sectors_written);
+                json.kv("usage", kv.second.usage);
+                json.end();
+            }
+        }
+        json.end();
     }
     json.end();
 
     json.key("systemd_units");
     json.raw_value(systemd_units);
 
-    json.key("user");
+    json.key("lsblk");
+    json.raw_value(lsblk);
+
+    json.key("users");
     json.list_start();
     for (auto &u: users) {
         json.list_entry();
@@ -351,14 +442,14 @@ string generate_json() {
     }
     json.list_end();
 
-    json.key("shell");
+    json.key("shells");
     json.list_start();
     for (auto &s: shells) {
         json.list_entry(s);
     }
     json.list_end();
 
-    json.key("proc");
+    json.key("processes");
     json.start();
     {
         for (auto &kv: procs) {
@@ -417,6 +508,12 @@ void query() {
     for (auto &kv: sys.cpus) {
         calc_cpu(kv.second);
     }
+    for (auto &kv: sys.diskstats) {
+        calc_disk(kv.second);
+    }
+    sys.net_devs = get_net_devs();
+    calc_net();
+
     vector<int> pids = get_pids();
     procs.clear();
     for (int &pid : pids) {
@@ -442,6 +539,7 @@ void query() {
 int main() {
     try {
         systemd_units = systemd_list_units();
+        lsblk = exec("lsblk -J");
         users = get_users();
         shells = get_shells();
         boost::asio::io_service io;

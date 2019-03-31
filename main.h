@@ -18,6 +18,23 @@ struct cpu_info {
     float usage;
 };
 
+struct diskstat {
+    string name;
+    uint reads_completed, reads_merged, sectors_read, time_read;
+    uint writes_completed, writes_merged, sectors_written, time_write;
+    uint io_in_progress, time_io, weighted_time_io;
+    // new since kernel 4.18+
+    uint discards_completed, discards_merged, sectors_discarded, time_discard;
+    // ---------------------------------
+    float usage;
+};
+
+struct net_dev {
+    string interface;
+    ulong receive_bytes, receive_packets, receive_errs, receive_drop, receive_fifo, receive_frame, receive_compressed, receive_multicast;
+    ulong transmit_bytes, transmit_packets, transmit_errs, transmit_drop, transmit_fifo, transmit_colls, transmit_carrier, transmit_compressed;
+};
+
 struct sys_info {
     float uptime;
     int clock_ticks;
@@ -36,10 +53,14 @@ struct sys_info {
     int gpu_temp;
     float gpu_power_draw, gpu_power_limit;
     int gpu_graphics_clock, gpu_sm_clock, gpu_mem_clock, gpu_video_clock;
-
     // ----------------------------
     map<string, cpu_info> cpus;
     uint ncpus;
+    // ----------------------------
+    map<string, diskstat> diskstats;
+    // ----------------------------
+    map<string, net_dev> net_devs;
+    float net_receive_speed, net_transmit_speed;
 };
 
 struct proc_info {
